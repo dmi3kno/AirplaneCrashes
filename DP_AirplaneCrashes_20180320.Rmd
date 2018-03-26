@@ -1,0 +1,412 @@
+---
+title: "Airplane Crashes Since 1908"
+author: "Dmytro Perepolkin"
+output: 
+  html_notebook: 
+    code_folding: hide
+    theme: lumen
+    toc: yes
+    toc_float: yes
+---
+
+```{r, echo=FALSE, error=FALSE, message=FALSE, warning=FALSE}
+Sys.setenv("HTTP_PROXY"="") # private network settings
+Sys.setenv("HTTPS_PROXY"="") # private network settings
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(fuzzyjoin)
+library(stringr)
+library(ggplot2)
+library(lubridate)
+library(geocodeHERE)
+library(hrbrthemes)
+```
+
+> Analysis of the public dataset: "Airplane Crashes and Fatalities Since 1908" (Full history of airplane crashes throughout the world, from 1908-present) hosted by [Open Data by Socrata](https://www.kaggle.com/saurograndi/airplane-crashes-since-1908)
+> 
+>  - Justify whether it is safer to take the aircraft nowadays. Support your decision with data.
+>  - Apply machine learning technique to predict any interesting topic of this.
+
+# Safety
+## Exploratory data analysis
+```{r, message=FALSE, warning=FALSE, error=FALSE}
+crash_df <- read_csv("input/Airplane_Crashes_and_Fatalities_Since_1908.csv.zip", 
+                     col_types = cols())
+
+
+#glimpse(crash_df)
+# clean up location, fix the date, split the route (if possible)
+crash_df <- crash_df %>% 
+  replace_na(list(Operator="", Route="", Summary="")) %>% 
+  mutate(Date=mdy(Date),
+         Year=lubridate::year(Date),
+         Pass_Aboard=ifelse(str_detect(Summary, "[Cc]argo|[Mm]ail"), 0, pmax(0, Aboard-2)),
+         Pass_Fat=ceiling(Pass_Aboard/Aboard*Fatalities))
+
+```
+
+Even from the first few records we can see that quite a few of the crashed airplanes belong to military. We should probably exclude those instances, because the risk taking levels and, likely, the nature of crashes are incomparable to those experienced in civil aviation. It also very unlikely that these observations will help us answer the research question whether it is safer to take the airplane now, compared to the level of risk in the past. At the end of the day, few of us will probably have the chance to fly in a military plane.
+
+```{r}
+civ_crash_df <- crash_df %>% filter(!str_detect(Operator, "[Mm]ilitary"))
+civ_crash_df
+```
+
+Another consideration is that, since we are talking about "taking airplane" vs. "driving airplane" I assume we are talking about being a passenger, and not one of the pilots. We probably should exclude small airplanes that are not intended for carrying too many passengers. Lets have a quick look at the distribution of `Aboard` variable in the dataset - which serves as a proxy for the airplane size.
+
+```{r}
+ggplot(civ_crash_df) +
+  geom_histogram(aes(x=Aboard), bins = 100)+
+  scale_x_log10()+
+  theme_ipsum_rc(grid = FALSE)
+```
+
+Unfortunately, it seems like we will have to throw away quite a lot of observations. A lot of the civil airplane crashes correspond to the accidents with less than 10 people onboard (nearly half of all observations in some years). 
+
+```{r}
+civ_crash_df %>% group_by(Year, Aboard=cut(Aboard, c(0,2,10,10000))) %>% 
+  summarise(Crashes=n()) %>% 
+  ggplot()+
+  geom_line(aes(x=Year, y=Crashes, group=Aboard, color=Aboard))+
+  theme_ipsum_rc(grid = FALSE)
+```
+
+## Expanding the frame
+
+Before we dive into answering the question "whether it is safer to take the aircraft nowadays", we could stop and ask "What would be the reasonable alternative to air travel?". Increase in air travel has coincided with explosion in the use of private vehicles (cars and buses) and perhaps, overal decrease in other (more tradtional) modes of transportation. It would be probably very difficult to answer a question "How much more safe is it to take the aircraft now compared to other alternatives?". At the end of the day, transportation worldwide is stil [dominated by private cars and buses](https://en.wikipedia.org/wiki/Mode_of_transport).
+
+Perhaps a little more useful frame would be to look at the safety of air travel in light of the general increase in the air travel and use of airplanes around the world. 
+
+> Safety of air travel is a question of proportions: "Has the share of the airplanes that land crashing increased over time?"
+
+Worldbank published ICAO datasets for [civil airplane departures](https://data.worldbank.org/indicator/IS.AIR.DPRT) and total number of [air passengers carried](https://data.worldbank.org/indicator/IS.AIR.PSGR) that may be useful to assess general trend of air travel over time. Let's try to import and visualize these datasets
+
+```{r, message=FALSE, warning=FALSE, error=FALSE}
+# Air transport, registered carrier departures worldwide
+# Registered carrier departures worldwide are domestic takeoffs and takeoffs abroad of air carriers registered in the country.
+dep_df <- read_csv(unz("input/API_IS.AIR.DPRT_DS2_en_csv_v2.zip", 
+                       "API_IS.AIR.DPRT_DS2_en_csv_v2.csv"), col_types = cols(),
+                   skip = 4) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`, X63)) %>% 
+  gather(key=Year, value=Departures, -c(`Country Name`, `Country Code`)) %>% 
+  mutate(Departures=as.numeric(Departures),
+         Year=as.integer(Year))
+
+# Air transport, passengers carried
+# Air passengers carried include both domestic and international aircraft passengers of air carriers registered in the country.
+pass_df <- read_csv(unz("input/API_IS.AIR.PSGR_DS2_en_csv_v2.zip", 
+                       "API_IS.AIR.PSGR_DS2_en_csv_v2.csv"), col_types = cols(),
+                   skip = 4) %>% 
+  select(-c(`Indicator Name`, `Indicator Code`, X63)) %>% 
+  gather(key=Year, value=Passengers, -c(`Country Name`, `Country Code`)) %>% 
+  mutate(Passengers=as.numeric(Passengers),
+         Year=as.integer(Year))
+```
+
+## Testing the hypothesis
+
+Our hypothesis is that air travel is becoming safer over time, so that the risk of the airplane crash has been reduced in the recent years compared to the same risk in the past. 
+
+Lets summarize departures and crashes per year and look at number of crashes per million of departures. Here we will be using non-linear regression because out target variable is sensored (can not be less than 0). Alternative could be to use logistic or probit function, because our data can be interpreted as "number of successes" in the total number of trials.
+
+```{r}
+crash_per_year <- civ_crash_df %>% 
+  group_by(Year) %>% 
+  summarise(Crashes=n())
+
+dep_per_year <- dep_df %>% 
+  group_by(Year) %>% 
+  summarise(Departures=sum(Departures, na.rm = TRUE))
+
+dep_crash_df <- left_join(crash_per_year, dep_per_year, by="Year") %>% 
+  filter(Year>=1970) %>% 
+  mutate(Crash_Ratio=Crashes/Departures)
+
+dep_crash_df %>% 
+  ggplot(aes(x=Year, y=Crash_Ratio*1e6))+
+  geom_line()+
+  geom_smooth()+
+  theme_ipsum_rc(grid=FALSE)+
+  labs(y="Crashes per million departures")
+```
+
+Similarly, we could look at number of fatalities per million passengers carried by airplanes. We can safely assume that Cargo and Mail planes are not supposed to carry passengers, at least travellers on those airplanes that are not pilots would not be counted towards ICAO passenger statistic. Further, lets assume that the Fatalities are proportionally distributed among crew and passengers.
+
+```{r}
+passenger_fatalities_per_year <- civ_crash_df %>% 
+  group_by(Year) %>% 
+  summarise(Fatalities=sum(Pass_Fat, na.rm = TRUE))
+
+pass_per_year <- pass_df %>% 
+  group_by(Year) %>% 
+  summarise(Passengers=sum(Passengers, na.rm = TRUE))
+
+pass_fat_df <- left_join(passenger_fatalities_per_year, pass_per_year, by="Year") %>% 
+  filter(Year>=1970) %>% 
+  mutate(Fatalities_Ratio=Fatalities/Passengers)
+
+
+pass_fat_df %>% 
+  ggplot(aes(x=Year, y=Fatalities_Ratio*1e6))+
+  geom_line()+
+  geom_smooth()+
+  theme_ipsum_rc(grid=FALSE)+
+  labs(y="Fatalities per million passengers carried")
+```
+
+There are several limitations to this graph:
+
+ - Missing values in the Airplane Crash dataset - Fatalities column in the Airplane Crash data contains missing values. The dataset itself might be missing some important records of catastrofes. Therefore total number of crashes per year may be understated. There could also be errors and typos in the data.
+ - Missing values in the Carrier Departures dataset - ICAO may have excluded certain departures from its dataset. Data for some countries is materially missing (e.g. no data is registred for Afganistan between 2001-2009). This may lead to understatement of Departures.
+ - Missing values in the Passenger carried dataset - Fatalities include both passengers and pilots and service personnel, if any, while Passenger dataset does not include those categories of travellers into the total count of fatalities. One adjustment could be to assume certain number of pilots and service personnel per plane and deduct those before calculating total number of fatalities per year. This may be, however difficult, as the number of service people varies with type of aircraft and the number of guest passengers onboard. Generally, the share of personnel Aboard the aircraft has unlikely changed over the last decades, so it might not be such a material inconsistency for calculating number of fatalities per million of passengers.
+ - Service personnel (crew other than pilots) is not accounted for, so the estimate of Passenger Fatalities may be biased upwards. 
+ 
+The conclusion of whether the air has become a safer place may vary depending on the question. We could compare total number of crashes to total number of departures in previous decades using chi-square test. We observe very low p-values, which gives us grounds to reject null-hypothesis of proportion equality.
+
+```{r}
+cat("Crash ratio")
+
+dep_crash_df %>% group_by(Decade=Year%/%10*10) %>% 
+  summarise(Total_Crashes=sum(Crashes), Total_Departures=sum(Departures)) %>% 
+  mutate(Total_Landings=Total_Departures - Total_Crashes) %>% 
+  select(Total_Crashes, Total_Landings) %>% nest() %>% 
+  mutate(pp=map(data, ~pairwise.prop.test(x=as.matrix(.x)))) %>% 
+  mutate(ppt=map(pp, tidy)) %>% 
+  unnest(ppt) %>% filter(group1==4)
+
+cat("Fatalities ratio")
+pass_fat_df %>% group_by(Decade=Year%/%10*10) %>% 
+  summarise(Total_Passengers=sum(Passengers), Total_Fatalities=sum(Fatalities)) %>% 
+  mutate(Total_Survivors=Total_Passengers - Total_Fatalities) %>% 
+  select(Total_Fatalities, Total_Survivors) %>% nest() %>% 
+  mutate(pp=map(data, ~pairwise.prop.test(x=as.matrix(.x)))) %>% 
+  mutate(ppt=map(pp, tidy)) %>% 
+  unnest(ppt) %>% filter(group1==4)
+
+```
+
+Yet another approach could be to look at the trend of time-series exponential smoothing `forecast::ets()` model. Here, `level` is trending down and `slope` coefficient is staying within the negative range, although the trend started to "level out" in the recent decades (hence, `slope` is steadily becoming less negative). 
+
+```{r}
+ts(dep_crash_df$Crash_Ratio*1e6, start = 1970, frequency = 1) %>% 
+  forecast::ets() %>% plot
+
+```
+
+
+# More text
+
+While working on this assignment I came across richer dataset from Aviation Safety Network, which contains more detailed text descriptions along with other nicely structured details (such as country, continent, clear separation between crew and passengers, etc). This dataset is hosted online at [ASN website](https://aviation-safety.net), as well as available for download [on GitHub](https://github.com/salspaugh/registre/tree/master/datasets/plane-crashes). We will download this dataset and store it for reuse.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+# from https://github.com/salspaugh/registre/tree/master/datasets/plane-crashes
+asn_df <- read_csv("input/plane-crashes.ascii.csv.tar", col_types = cols())
+
+```
+
+# Peredicting catastrophes
+
+Since we have detailed description of the incident we may want to predict severity of the incident as measured by share of survivors from the airplane crash. We will define the situation as "desperate" (chances of survival are slim) if more than 90% of people perished. This is binary classification model, where our objective is to predict whether fatalities exceed 90% of people aboard (lets call this variable `catastrophe`).
+
+Lets prepare the data. We will assume that only `text` description, `year` and number of people `aboard` is available at the time of prediction. We will use both Air Crash and ASN datasets to train text vectors but only one of them to build the predictive model.
+
+```{r}
+crash_txt_df <- crash_df %>% 
+  select(Operator, Type, Summary, Year, Aboard, Fatalities) %>% 
+  mutate(text=paste(Operator, Type, Summary), 
+         catastrophe=as.numeric(Fatalities/Aboard>0.9)) %>% 
+  select(year=Year, aboard=Aboard,
+         text, catastrophe)
+
+asn_txt_df <- asn_df %>% 
+  select(operator, type, narrative, year, total_occupants, total_fatalities) %>% 
+  mutate(text=paste(operator, type, narrative), 
+        catastrophe=as.numeric(total_fatalities/total_occupants>0.9)) %>% 
+    select(year, aboard=total_occupants,
+           text, catastrophe)
+
+```
+
+We can now proceed to training word vectors. Some preparation of the text is required. We will tokenize text by word, as well as drop stop words and numbers.
+
+> Instead of training the vectors we use pre-trained embeddings. I have tried using GloVe embeddings with 400k terms trained on Wikipedia articles. The effect on accuracy is relatively small (ca. +0.02 AUC)
+
+```{r}
+suppressPackageStartupMessages(library(h2o))
+h2o.init(nthreads = -1, max_mem_size = "28g")
+h2o.no_progress()
+
+all_text <- c(unique(crash_txt_df$text), unique(asn_txt_df$text))
+summaries <- data.frame(summaries=all_text, stringsAsFactors = FALSE)
+summary.hex <- as.h2o(summaries, destination_frame = "summary.hex")
+STOP_WORDS = unique(tidytext::stop_words$word)
+
+tokenize <- function(sentences, stop.words = STOP_WORDS) {
+  tokenized <- h2o.tokenize(sentences, "\\\\W+")
+  
+  # convert to lower case
+  tokenized.lower <- h2o.tolower(tokenized)
+  # remove short words (less than 2 characters)
+  tokenized.lengths <- h2o.nchar(tokenized.lower)
+  tokenized.filtered <- tokenized.lower[is.na(tokenized.lengths) || tokenized.lengths >= 2,]
+  # remove words that contain numbers
+  tokenized.words <- tokenized.lower[h2o.grep("[0-9]", tokenized.lower, invert = TRUE, output.logical = TRUE),]
+  
+  # remove stop words
+  tokenized.words[is.na(tokenized.words) || (! tokenized.words %in% STOP_WORDS),]
+}
+
+#Break descriptions into sequence of words
+words <- tokenize(summary.hex$summaries)
+#
+# Load pre-trained word embeddings
+#w2v.frame <- data.table::fread("glove/glove.6B.100d.txt", sep = " ")
+#w2v.hex <- as.h2o(w2v.frame, destination_frame = "w2v.hex")
+#
+#w2v.model <- h2o.word2vec(pre_trained = w2v.hex
+#                          , model_id = "w2v_model"
+#                          , vec_size = 100) 
+
+```
+
+We will train small number of vectors to conserve time and memory resources. Once the vectors are trained, we will try to use them to find synonims for words.
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+#Build word2vec model
+vectors <- 50 # to save time & memory
+
+w2v.model <- h2o.word2vec(words
+                          , model_id = "w2v_model"
+                          , vec_size = vectors
+                          , min_word_freq = 5
+                          , window_size = 5
+                          , init_learning_rate = 0.025
+                          , sent_sample_rate = 0
+                          , epochs = 25) # to save time
+
+
+```
+
+Ok, the model seems to be working. Lets average out vectors for each description and merge them back into original dataset for use in modeling.
+
+```{r}
+cat("Synonyms for the word 'altitude'")
+h2o.findSynonyms(w2v.model, "altitude", count = 10)
+
+#"Get vectors for each summary"
+summary_all.vecs <- h2o.transform(w2v.model, words, aggregate_method = "AVERAGE")
+
+#"Convert to data frame & merge results"
+summary_all.vecs <- as.data.frame(summary_all.vecs, stringsAsFactors=FALSE)
+summary_all <- cbind(summaries, summary_all.vecs)
+
+crash_txt_df_joined <- crash_txt_df %>% 
+  left_join(summary_all, by=c("text"="summaries")) %>% 
+  drop_na()
+```
+
+We will use awesome AutoML functionality in H2O to make initial model. Lets split our data in three pieces: training, validation and test. Our intention is to touch `test` data only once (at the end) and use validation for ensembling and model tuning.
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+set.seed(123)
+crash_txt_df.hex <- as.h2o(crash_txt_df_joined, destination_frame = "crash_txt_df.hex")
+crash_txt_split <- h2o.splitFrame(crash_txt_df.hex, ratios = c(0.7, 0.2))
+
+# Create a training set from the 1st dataset in the split
+train <- crash_txt_split[[1]]
+# Create a validation set from the 2nd dataset in the split
+valid <- crash_txt_split[[2]]
+# Create a test set from the 3rd dataset in the split
+test <- crash_txt_split[[3]]
+
+# Identify predictors and response
+y <- "catastrophe"
+x_b <- c("year", "aboard")
+x <- setdiff(names(train), y)
+
+# For binary classification, response should be a factor
+train[,y] <- as.factor(train[,y])
+test[,y] <- as.factor(test[,y])
+
+```
+
+Lets first make a quick baseline with only two numerical features - `year` and `aboard`. We will build simple `glm` classification model and measure its performance on holdout data.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+gml <- h2o.glm(x = x, y = y, family = "binomial",
+              training_frame = train,
+              validation_frame = valid)
+```
+
+Below is the performance of the `glm` model on validation frame
+
+```{r}
+h2o.performance(gml, valid)
+```
+
+Lets repeat the training excercise using full power of `AutoML` algorithm with stacking and ensembling of Random Forest, Neural Networks, GBM and GLM models.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = train,
+                  leaderboard_frame = valid,
+                  max_runtime_secs = 180)
+pred <- h2o.predict(aml@leader, test)
+```
+
+
+Once the model is trained lets look at the list of best models and the metrics for the winning model on holdout data. As you can see, with proper threshold (based on max f1) we  managed to achieve almost 0.8 AUC and significantly improved on the `glm` baseline. 
+
+```{r}
+# View the AutoML Leaderboard
+aml@leaderboard
+
+
+# The leader model is stored in aml@leader
+h2o.performance(aml@leader, valid)
+```
+
+Lets visualize predictive words across four categories (corresponding to confusion matrix):
+
+
+```{r}
+library(tidytext)
+library(wordcloud)
+
+h2o.cbind(pred, test) %>% as.data.frame() %>% 
+  select(predict:catastrophe) %>% 
+  mutate(error=abs(as.numeric(as.character(catastrophe))-p1),
+         confusion=case_when(
+           predict==1 & catastrophe==1 ~ "true positive",
+           predict==0 & catastrophe==1 ~ "false negatives",
+           predict==1 & catastrophe==0 ~ "false positives",
+           predict==0 & catastrophe==0 ~ "true negatives"
+         )) %>% group_by(confusion) %>% 
+  select(confusion, text) %>% 
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words) %>% 
+  count(confusion, word, sort = TRUE) %>% 
+  ungroup() %>% cast_tdm(word, confusion, n) %>% 
+  with(comparison.cloud(term.matrix = as.matrix(.), 
+                        scale=c(2,.2),
+                        title.size = 1,
+                        max.words = 100))
+
+```
+
+Basically True positives (properly predicted disasters) are characterized by military incidents or collisions into mountains. True negatives are about incidents on the runway. The False Positives and False negatives are much more difficult to classify, I believe, due to very diverse vocabulary and relatively small number of training examples.
+
+
+# Other ideas
+## Things I could have done, if I had more time
+ - Add airplane make to baseline to make it a little more challenging to beat.
+ - Analyze how safety has changed per country / continent. Is it true that Aeroflot is becoming worse every year?
+ - Is it possible that "aboard" is slightly leaking? e.g. are smaller airplanes more likely to be completely destroyed, or is it only the sampling effect?
+ - Try to beat word embeddings with Bag-of-Words. Memory might be an issue, so would need to watch out for this one.
+ - TF-IDF weighting for averaging of vectors. Not currently implemented in H2O pipeline. Could rewrite the whole analysis in `text2vec`
+ - Reimplement `Paragraph2vec` paper. There are some tips in `text2vec` package, but deeper look is required in order to implement it correctly. Have not found evidence of people actually reproducing results of that paper.
+
